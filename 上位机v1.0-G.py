@@ -1,22 +1,30 @@
-import paho.mqtt.client as mqtt
-import ssl
 import json
 import socket
+import ssl
 import time
 
-DEBUG = False
+import paho.mqtt.client as mqtt
+
+DEBUG = True
 
 ################## 以下为用户配置区 ##################
-MQTT_SERVER = "ip_address"  # 将ip_address替换为打印机的IP地址
-PASSWORD = "your_password"  # 将your_password替换为局域网模式里的密码
-DEVICE_SERIAL = "your_device_serial"  # 将your_device_serial替换为设备的序列号
-TCP_SERVER = "ip_address"  # 将ip_address替换为驱动板的IP地址
+MQTT_SERVER = ""  # 将ip_address替换为打印机的IP地址
+PASSWORD = ""  # 将your_password替换为局域网模式里的密码
+DEVICE_SERIAL = ""  # 将your_device_serial替换为设备的序列号
+TCP_SERVER = ""  # 将ip_address替换为驱动板的IP地址
 ##################### 参数配置 ######################
-CH_DEF = 1 # 当前通道
-F_CG_T = "230" # 换色温度
+CH_DEF = -1 # 当前通道
+F_CG_T = "255" # 换色温度
 CH_MAP = [1, 2, -1, -1]  # 通道映射表
 CH_RE_LEN = [2, 2, 2, 2] # 通道抽回时间（秒）
 CH_AF = [1, 1, 1, 1] # 通道辅助送料开关
+USE_PRINTER_UNLOAD = False   # 使用打印退料，(记得把换料gcode里的退料取消)
+# 换料gcode中移除以下代码
+# G1 X180 F18000
+# G1 Y180 F3000
+# G1 X200 F1500
+# G1 E-2 F500
+# G1 X180 F3000
 ################## 以上为用户配置区 ##################
 
 # 定义服务器信息和认证信息
@@ -24,6 +32,75 @@ TCP_PORT = 3333
 MQTT_PORT = 8883
 MQTT_VERSION = mqtt.MQTTv311
 USERNAME = "bblp"
+
+# 读取 JSON 文件
+def read_json_file(file_path):
+    try:
+        with open(file_path, 'r') as file:
+            data = json.load(file)
+            return data
+    except FileNotFoundError:
+        #print(f"找不到文件：{file_path}")
+        return None
+    except ValueError as e:
+        print(f"解析 JSON 失败：{e}")
+        return None
+
+# 写入 JSON 文件
+def write_json_file(file_path, data):
+    try:
+        with open(file_path, 'w') as file:
+            json.dump(data, file, indent=4)
+            return True
+    except FileNotFoundError:
+        print(f"找不到文件：{file_path}")
+        return False
+    except IOError as e:
+        print(f"写入 JSON 失败：{e}")
+        return False
+
+def get_input_with_default(prompt, default_value):
+    user_input = input(f"{prompt} ({default_value}): ")
+    return user_input if user_input else default_value
+
+def get_boolean_input(prompt, default_value):
+    user_input = input(f"{prompt} ({'Y/n' if default_value else 'y/N'}): ").lower()
+    if user_input == '':
+        return default_value
+    else:
+        return user_input == 'y'
+
+# 读取 配置 文件
+read_data = read_json_file('config.json')
+if read_data is None:
+    while MQTT_SERVER == "":
+        MQTT_SERVER = input("打印机IP地址：")
+    while PASSWORD == "":
+        PASSWORD = input("打印机局域网密码：")
+    while DEVICE_SERIAL == "":
+        DEVICE_SERIAL = input("打印机序列号：")
+    while TCP_SERVER == "":
+        TCP_SERVER = input("AMS驱动板IP地址: ")
+else:
+    MQTT_SERVER = read_data["MQTT_SERVER"]
+    PASSWORD = read_data["PASSWORD"]
+    DEVICE_SERIAL = read_data["DEVICE_SERIAL"]
+    TCP_SERVER = read_data["TCP_SERVER"]
+    F_CG_T = read_data["F_CG_T"]
+    CH_DEF = read_data["CH_DEF"]
+    USE_PRINTER_UNLOAD = read_data["USE_PRINTER_UNLOAD"]
+    print('成功读取配置文件，如果想修改配置可打开"config.json"进行配置，或者删除改文件重新生成')
+
+if CH_DEF == -1 or get_boolean_input(f"当前通道：{CH_DEF}\n换色温度: {F_CG_T}\n退料方式: {'打印机' if USE_PRINTER_UNLOAD else 'gcode'} \n是否修改?", False):
+    CH_DEF = int(get_input_with_default(f"当前通道", CH_DEF))
+    F_CG_T = get_input_with_default("换色温度", F_CG_T)
+    USE_PRINTER_UNLOAD = get_boolean_input("使用打印机退料", USE_PRINTER_UNLOAD)
+
+if USE_PRINTER_UNLOAD:
+    print('提示：当前使用打印机默认退料方式, 请确保移除换料gcode中的切料代码')
+
+read_data = {"MQTT_SERVER": MQTT_SERVER, "PASSWORD": PASSWORD, "DEVICE_SERIAL": DEVICE_SERIAL, "TCP_SERVER": TCP_SERVER, "F_CG_T": F_CG_T, "CH_DEF": CH_DEF, "USE_PRINTER_UNLOAD": USE_PRINTER_UNLOAD}
+write_json_file('config.json', read_data)
 
 # 创建一个TCP/IP socket
 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -62,7 +139,7 @@ def connect_to_server(server_ip, server_port):
 
 # 向AMS发送指令
 def send_ams(data):
-    global sock
+    global sock, TCP_SERVER
     """发送数据到服务器，如果连接断开，自动重新连接并重新发送"""
     while True:
         try:
@@ -118,25 +195,32 @@ def reconnect(client, delay=3):
             print(f"重连竹子失败 {delay} 秒后重试...")
             time.sleep(delay)  # 等待一段时间后再次尝试
 
-def piblish_gcode(client, g_code):
+def publish_gcode(client, g_code):
     operation_code = '{"print": {"sequence_id": "1", "command": "gcode_line", "param": "'+g_code+'"},"user_id":"1"}'
     client.publish(TOPIC_PUBLISH, operation_code)
 
-def piblish_resume(client):
+def publish_resume(client):
     # piblish_gcode(client, "G1 E4 F200")
     client.publish(TOPIC_PUBLISH, bambu_resume)
 
+def publish_unload(client, unloadTemp = 255):
+    client.publish(TOPIC_PUBLISH, 
+                   '{"print":{"command":"ams_change_filament","curr_temp":220,"sequence_id":"1","tar_temp":' + 
+                   str(unloadTemp) 
+                   + ',"target":255},"user_id":"1"}')
+    
 # 当收到服务器发来的消息时的回调
 def on_message(client, userdata, message):
     global step, filament_next, filament_current, cg_num
+    global F_CG_T
     if DEBUG:
         print(f"Received message '{str(message.payload.decode('utf-8'))}' on topic '{message.topic}'")
     try:
         # 尝试解析JSON数据
         payload = str(message.payload.decode('utf-8'))
         json_data = json.loads(payload)
-        if DEBUG:
-            print(json_data)
+        # if DEBUG:
+        #     print(json_data)
         # 这里可以根据需要进一步处理json_data
     except json.JSONDecodeError:
         # 如果消息不是JSON格式，打印错误
@@ -153,18 +237,23 @@ def on_message(client, userdata, message):
                             if DEBUG:
                                 print(f"颜色: {json_data['print']['mc_remaining_time']}")
                             filament_next = find_channel(json_data["print"]["mc_remaining_time"] + 1) # 更换通道
-                            print(f"当前AMS通道：{filament_current} 下一个AMS通道: {filament_next}")
+                            print(f"当前AMS通道：{filament_current+1} 下一个AMS通道: {filament_next+1}")
                             if (filament_next == -1):
                                 print("未找到对应AMS通道，或耗材已耗尽")
                                 return
                             if filament_next == filament_current: # 无需更换
                                 print("无需更换")
-                                piblish_resume(client) # 继续打印
+                                publish_resume(client) # 继续打印
                                 return
+                            
                             ams_control(filament_current, 2) # 抽回当前通道
-                            piblish_gcode(client, "G1 E-25 F500\nM109 S" + F_CG_T + "\n") # 抽回一段距离，提前升温
+                            publish_gcode(client, "G1 E-25 F500\nM109 S" + F_CG_T + "\n") # 抽回一段距离，提前升温
+
+                            if USE_PRINTER_UNLOAD:
+                                publish_unload(client, F_CG_T) # 调用打印机卸载耗材
+
                             print("等待卸载完成")
-                            step = 2 
+                            step = 2
         elif step == 2:
             if "hw_switch_state" in json_data["print"]:
                 if json_data["print"]["hw_switch_state"] == 0: # 断料检测为无料
@@ -183,7 +272,7 @@ def on_message(client, userdata, message):
                     # piblish_gcode(client, "G1 E4 F200") # 输送一段距离
                     time.sleep(2)
                     print("换色完成\n")
-                    piblish_resume(client)
+                    publish_resume(client)
                     time.sleep(5)
                     if CH_AF[filament_next] == 0:
                         ams_control(filament_next, 0) # 停止输送
